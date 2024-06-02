@@ -40,7 +40,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
   address constant renbtc = 0xEB4C2781e4ebA804CE9a9803C67d0893436bB27D;
   address constant renCrv = 0x93054188d876f558f4a66B2EF1d97d16eDf0895B;
   address constant threepool = 0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7;
-  address constant tricrypto = 0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5;
+  address constant tricrypto = 0xD51a44d3FaE010294C616388b506AcdA1bfAAE46;
   address constant renCrvLp = 0x49849C98ae39Fff122806C06791Fa73784FB3675;
   address constant bCrvRen = 0x6dEf55d2e18486B9dDfaA075bc4e4EE0B28c1545;
   address constant settPeak = 0x41671BA1abcbA387b9b2B752c205e22e916BE6e3;
@@ -49,7 +49,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
   uint24 constant usdcWethFee = 500;
   uint256 public governanceFee;
   bytes32 constant PERMIT_TYPEHASH = 0xea2aa0a1be11a07ed86d755c93467f4f82362b452371d1ba94d1715123511acb;
-  bytes32 constant LOCK_SLOT = keccak256("upgrade-lock-v3");
+  bytes32 constant LOCK_SLOT = keccak256("upgrade-lock-v5");
   uint256 constant GAS_COST = uint256(42e4);
   uint256 constant ETH_RESERVE = uint256(5 ether);
   uint256 internal renbtcForOneETHPrice;
@@ -61,6 +61,12 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
   bytes32 internal PERMIT_DOMAIN_SEPARATOR_WBTC;
   mapping(address => uint256) public noncesUsdt;
   bytes32 constant PERMIT_DOMAIN_SEPARATOR_USDT_SLOT = keccak256("usdt-permit");
+  mapping(address => bool) isHarvester;
+
+  modifier onlyHarvester() {
+    require(isHarvester[msg.sender], "!harvester");
+    _;
+  }
 
   function getUsdtDomainSeparator() public view returns (bytes32) {
     bytes32 separator_slot = PERMIT_DOMAIN_SEPARATOR_USDT_SLOT;
@@ -81,6 +87,11 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     governance = _governance;
   }
 
+  function setHarvester(address harvester) public {
+    require(msg.sender == governance, "!governance");
+    isHarvester[harvester] = true;
+  }
+
   function approveUpgrade(bool lock) public {
     bool isLocked;
     bytes32 lock_slot = LOCK_SLOT;
@@ -91,20 +102,11 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     }
     require(!isLocked, "cannot run upgrade function");
 
+    IERC20(wbtc).safeApprove(tricrypto, ~uint256(0) >> 2);
     IERC20(usdt).safeApprove(tricrypto, ~uint256(0) >> 2);
-    bytes32 permit_usdt_separator = keccak256(
-      abi.encode(
-        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-        keccak256("USDT"),
-        keccak256("1"),
-        getChainId(),
-        usdt
-      )
-    );
 
     assembly {
       sstore(lock_slot, lock)
-      sstore(permit_slot, permit_usdt_separator)
     }
   }
 
@@ -154,6 +156,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     governanceFee = uint256(5e17);
     governance = _governance;
     strategist = _strategist;
+    isHarvester[msg.sender] = true;
     keeperReward = uint256(1 ether).div(1000);
     IERC20(renbtc).safeApprove(btcGateway, ~uint256(0) >> 2);
     IERC20(renbtc).safeApprove(renCrv, ~uint256(0) >> 2);
@@ -249,7 +252,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
   ) public payable returns (uint256 amountToBurn) {
     require(asset == wbtc || asset == usdc || asset == renbtc || asset == address(0x0), "!approved-module");
     if (asset != address(0x0)) IERC20(asset).transferFrom(msg.sender, address(this), amount);
-    amountToBurn = asset == wbtc ? toRenBTC(amount.sub(applyRatio(amount, burnFee))) : asset == usdc
+    amountToBurn = asset == wbtc ? toRenBTCWithMinout(amount.sub(applyRatio(amount, burnFee)), minOut) : asset == usdc
       ? fromUSDC(minOut, amount.sub(applyRatio(amount, burnFee)))
       : asset == renbtc
       ? amount
@@ -263,6 +266,12 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     amountOut = IERC20(renbtc).balanceOf(address(this)).sub(balanceStart);
   }
 
+  function toRenBTCWithMinout(uint256 amountIn, uint256 minOut) internal returns (uint256 amountOut) {
+    uint256 balanceStart = IERC20(renbtc).balanceOf(address(this));
+    (bool success, ) = renCrv.call(abi.encodeWithSelector(IRenCrv.exchange.selector, 1, 0, amountIn, minOut));
+    amountOut = IERC20(renbtc).balanceOf(address(this)).sub(balanceStart);
+  }
+
   function fromUSDC(uint256 minOut, uint256 amountIn) internal returns (uint256 amountOut) {
     bytes memory path = abi.encodePacked(usdc, usdcWethFee, weth, wethWbtcFee, wbtc);
     ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
@@ -273,7 +282,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
       path: path
     });
     amountOut = ISwapRouter(routerv3).exactInput(params);
-    amountOut = toRenBTC(amountOut);
+    amountOut = toRenBTCWithMinout(amountOut, minOut);
   }
 
   function fromETHToRenBTC(uint256 minOut, uint256 amountIn) internal returns (uint256 amountOut) {
@@ -289,9 +298,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
       sqrtPriceLimitX96: 0
     });
     amountOut = ISwapRouter(routerv3).exactInputSingle{ value: amountIn }(params);
-    (bool success, ) = renCrv.call(abi.encodeWithSelector(IRenCrv.exchange.selector, 1, 0, amountOut, 1));
-    require(success, "!curve");
-    amountOut = IERC20(renbtc).balanceOf(address(this)).sub(amountStart);
+    amountOut = toRenBTCWithMinout(amountOut, minOut);
   }
 
   function toETH() internal returns (uint256 amountOut) {
@@ -304,14 +311,14 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     amountOut = address(this).balance.sub(amountStart);
   }
 
-  function fromUSDT(uint256 amountIn) internal returns (uint256 amountOut) {
+  function fromUSDT(uint256 amountIn, uint256 minOut) internal returns (uint256 amountOut) {
     uint256 wbtcIn = IERC20(wbtc).balanceOf(address(this));
     (bool success, ) = tricrypto.call(
       abi.encodeWithSelector(ICurveTricrypto.exchange.selector, 0, 1, amountIn, 0, false)
     );
     require(success, "!curve");
     wbtcIn = IERC20(wbtc).balanceOf(address(this)).sub(wbtcIn);
-    amountOut = toRenBTC(wbtcIn);
+    amountOut = toRenBTCWithMinout(wbtcIn, minOut);
   }
 
   function toUSDT(uint256 amountIn) internal returns (uint256 amountOut) {
@@ -328,7 +335,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     // no-op
   }
 
-  function earn() public {
+  function earn() public onlyHarvester {
     quote();
     toWBTC(IERC20(renbtc).balanceOf(address(this)));
     toETH();
@@ -336,10 +343,13 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     if (balance > ETH_RESERVE) {
       uint256 output = balance - ETH_RESERVE;
       uint256 toGovernance = applyRatio(output, governanceFee);
+      bool success;
       address payable governancePayable = address(uint160(governance));
-      governancePayable.transfer(toGovernance);
+      (success, ) = governancePayable.call{ value: toGovernance, gas: gasleft() }("");
+      require(success, "error sending to governance");
       address payable strategistPayable = address(uint160(strategist));
-      strategistPayable.transfer(output.sub(toGovernance));
+      (success, ) = strategistPayable.call{ value: output.sub(toGovernance), gas: gasleft() }("");
+      require(success, "error sending to strategist");
     }
   }
 
@@ -536,6 +546,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
     {
       params.gasDiff = computeCalldataGasDiff();
       if (params.data.length > 0) (params.minOut) = abi.decode(params.data, (uint256));
+      else params.minOut = 1;
     }
     require(block.timestamp < params.deadline, "!deadline");
     if (params.asset == wbtc) {
@@ -547,7 +558,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
       ); //  wbtc does not implement ERC20Permit
       {
         IERC20(params.asset).transferFrom(params.to, address(this), params.amount);
-        amountToBurn = toRenBTC(deductBurnFee(params.amount, 1));
+        amountToBurn = toRenBTCWithMinout(deductBurnFee(params.amount, 1), params.minOut);
       }
     } else if (params.asset == usdt) {
       params.nonce = noncesUsdt[to];
@@ -562,7 +573,7 @@ contract BadgerBridgeZeroController is EIP712Upgradeable {
         );
         require(success, "!usdt");
       }
-      amountToBurn = deductBurnFee(fromUSDT(params.amount), 1);
+      amountToBurn = deductBurnFee(fromUSDT(params.amount, params.minOut), 1);
     } else if (params.asset == renbtc) {
       {
         params.nonce = IERC2612Permit(params.asset).nonces(params.to);
